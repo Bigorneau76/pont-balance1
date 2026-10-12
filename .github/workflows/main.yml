@@ -6,7 +6,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -14,46 +13,17 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
-      - name: Ranger les fichiers dans les bons dossiers
+      - name: Creer le projet Pont Balance
         run: |
           set -e
-          TMP=$(mktemp -d)
-          find . -path ./.git -prune -o -type f \( -name '*.kt' -o -name '*.xml' \) -print -exec cp {} "$TMP"/ \;
-          rm -rf app
-          J=app/src/main/java/fr/sanimarc/pontbalance
-          R=app/src/main/res
-          mkdir -p "$J" "$R/layout" "$R/xml" "$R/values"
-          cp "$TMP"/*.kt "$J"/
-          cp "$TMP"/AndroidManifest.xml app/src/main/
-          cp "$TMP"/activity_main.xml "$R/layout/"
-          cp "$TMP"/device_filter.xml "$R/xml/"
-          cp "$TMP"/strings.xml "$TMP"/themes.xml "$R/values/"
-          cat > settings.gradle.kts <<'EOF'
-          pluginManagement {
-              repositories { google(); mavenCentral(); gradlePluginPortal() }
-          }
-          dependencyResolutionManagement {
-              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
-          }
-          rootProject.name = "PontBalance"
-          include(":app")
-          EOF
-          cat > build.gradle.kts <<'EOF'
-          plugins {
-              id("com.android.application") version "8.5.2" apply false
-              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
-          }
-          EOF
-          cat > gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx2048m
-          android.useAndroidX=true
-          kotlin.code.style=official
-          EOF
-          cat > app/build.gradle.kts <<'EOF'
+          mkdir -p projet && cd projet
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'FIN_FICHIER'
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
           }
+
           android {
               namespace = "fr.sanimarc.pontbalance"
               compileSdk = 34
@@ -64,12 +34,16 @@ jobs:
                   versionCode = 1
                   versionName = "1.0"
               }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
               compileOptions {
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
               kotlinOptions { jvmTarget = "17" }
           }
+
           dependencies {
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("androidx.appcompat:appcompat:1.7.0")
@@ -77,10 +51,755 @@ jobs:
               implementation("com.github.mik3y:usb-serial-for-android:3.8.1")
               implementation("com.squareup.okhttp3:okhttp:4.12.0")
           }
-          EOF
-          find app -type f
-      - run: gradle assembleDebug --no-daemon
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'FIN_FICHIER'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature android:name="android.hardware.usb.host" android:required="true" />
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_menu_compass"
+                  android:theme="@style/Theme.PontBalance">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTask">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Ouvre l'app automatiquement quand la balance est branchée -->
+                      <intent-filter>
+                          <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                          android:resource="@xml/device_filter" />
+                  </activity>
+
+                  <service
+                      android:name=".BalanceService"
+                      android:exported="false"
+                      android:foregroundServiceType="connectedDevice" />
+              </application>
+          </manifest>
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/Analyseur.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/Analyseur.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          /**
+           * Transforme la trame texte envoyée par la balance (touche Print)
+           * en poids + unité. Une pression sur Print peut produire plusieurs lignes
+           * (poids, poids unitaire, nombre de pièces) : on les regroupe.
+           */
+          object Analyseur {
+
+              data class Pesee(
+                  val poids: Double?,       // valeur avec unité de masse (g, kg, lb, oz)
+                  val unite: String?,
+                  val quantite: Double?,    // nombre de pièces si la balance l'envoie
+                  val trame: String         // texte brut complet, pour la traçabilité
+              )
+
+              private val unitesMasse = setOf("g", "kg", "mg", "lb", "oz", "t")
+              private val unitesPieces = setOf("pcs", "pc", "pce", "pces", "st")
+
+              // signe éventuel (collé ou séparé), nombre (virgule ou point), unité éventuelle
+              private val motif = Regex("""([+-])?\s*(\d+(?:[.,]\d+)?)\s*([A-Za-z]{1,4})?""")
+
+              fun analyser(lignes: List<String>): Pesee? {
+                  var poids: Double? = null
+                  var unite: String? = null
+                  var quantite: Double? = null
+
+                  for (ligne in lignes) {
+                      for (m in motif.findAll(ligne)) {
+                          val signe = m.groupValues[1]
+                          val nombre = m.groupValues[2].replace(',', '.').toDoubleOrNull() ?: continue
+                          val u = m.groupValues[3].lowercase()
+                          val valeur = if (signe == "-") -nombre else nombre
+                          when {
+                              u in unitesMasse && poids == null -> { poids = valeur; unite = u }
+                              u in unitesPieces && quantite == null -> quantite = valeur
+                          }
+                      }
+                  }
+                  if (poids == null && quantite == null) return null
+                  return Pesee(poids, unite, quantite, lignes.joinToString(" | ") { it.trim() })
+              }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/BalanceService.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/BalanceService.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.hardware.usb.UsbDevice
+          import android.hardware.usb.UsbManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import androidx.core.app.NotificationCompat
+          import com.hoho.android.usbserial.driver.CdcAcmSerialDriver
+          import com.hoho.android.usbserial.driver.UsbSerialDriver
+          import com.hoho.android.usbserial.driver.UsbSerialPort
+          import com.hoho.android.usbserial.driver.UsbSerialProber
+          import com.hoho.android.usbserial.util.SerialInputOutputManager
+
+          /**
+           * Service qui tourne en arrière-plan (même quand le MES Power Apps est au premier plan) :
+           * lit la balance en USB et envoie chaque pesée au flow.
+           */
+          class BalanceService : Service(), SerialInputOutputManager.Listener {
+
+              private var port: UsbSerialPort? = null
+              private var lecteur: SerialInputOutputManager? = null
+              private lateinit var reglages: Reglages
+              private lateinit var file: FileEnvoi
+
+              private val fil = HandlerThread("balance").apply { start() }
+              private val gestion = Handler(fil.looper)
+              private val tampon = StringBuilder()
+              private val lignesRecues = mutableListOf<String>()
+
+              // Une pression sur Print envoie plusieurs lignes d'affilée :
+              // on attend un court silence avant de considérer la pesée complète.
+              private val delaiRegroupementMs = 400L
+              private val finDePesee = Runnable { traiterPesee() }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  reglages = Reglages(this)
+                  file = FileEnvoi(this, reglages)
+                  demarrerPremierPlan()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_DEMANDER -> demanderPoids()
+                      else -> gestion.post { connecter() }
+                  }
+                  return START_STICKY
+              }
+
+              private fun demarrerPremierPlan() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(NotificationChannel("balance", "Pont balance", NotificationManager.IMPORTANCE_LOW))
+                  }
+                  val ouvrir = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n: Notification = NotificationCompat.Builder(this, "balance")
+                      .setContentTitle("Pont balance actif")
+                      .setContentText("Les pesées sont envoyées au MES")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .setContentIntent(ouvrir)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 29) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun trouverPilote(manager: UsbManager): UsbSerialDriver? {
+                  // 1) pilotes connus (FTDI, CP210x, CH34x, Prolific, CDC standard…)
+                  UsbSerialProber.getDefaultProber().findAllDrivers(manager).firstOrNull()?.let { return it }
+                  // 2) sinon on tente le mode "port COM virtuel" standard (CDC) sur le 1er appareil USB
+                  val appareil: UsbDevice = manager.deviceList.values.firstOrNull() ?: return null
+                  return try { CdcAcmSerialDriver(appareil).takeIf { it.ports.isNotEmpty() } } catch (e: Exception) { null }
+              }
+
+              private fun connecter() {
+                  fermer()
+                  val manager = getSystemService(USB_SERVICE) as UsbManager
+                  Etat.journaliser("Appareils USB vus : " + manager.deviceList.values.joinToString {
+                      "%04X:%04X %s".format(it.vendorId, it.productId, it.productName ?: "")
+                  }.ifEmpty { "aucun" })
+
+                  val pilote = trouverPilote(manager)
+                  if (pilote == null) {
+                      majStatut("Aucune balance USB détectée — vérifier le câble OTG")
+                      return
+                  }
+                  if (!manager.hasPermission(pilote.device)) {
+                      majStatut("Autorisation USB nécessaire — appuyer sur Connecter")
+                      val intent = Intent(MainActivity.ACTION_PERMISSION).setPackage(packageName)
+                      val flags = if (Build.VERSION.SDK_INT >= 31) PendingIntent.FLAG_MUTABLE else 0
+                      manager.requestPermission(pilote.device, PendingIntent.getBroadcast(this, 0, intent, flags))
+                      return
+                  }
+                  val connexion = manager.openDevice(pilote.device)
+                  if (connexion == null) { majStatut("Impossible d'ouvrir la balance"); return }
+
+                  try {
+                      val p = pilote.ports[0]
+                      p.open(connexion)
+                      val (bits, parite) = when (reglages.format) {
+                          "7O1" -> 7 to UsbSerialPort.PARITY_ODD
+                          "7E1" -> 7 to UsbSerialPort.PARITY_EVEN
+                          else -> 8 to UsbSerialPort.PARITY_NONE
+                      }
+                      try { p.setParameters(reglages.vitesse, bits, UsbSerialPort.STOPBITS_1, parite) }
+                      catch (e: UnsupportedOperationException) { /* port virtuel : réglage ignoré, normal */ }
+                      try { p.dtr = true; p.rts = true } catch (e: Exception) { }
+                      port = p
+                      lecteur = SerialInputOutputManager(p, this).also { it.start() }
+                      majStatut("✔ ${reglages.nomBalance} connectée (${pilote.javaClass.simpleName.removeSuffix("SerialDriver")})")
+                  } catch (e: Exception) {
+                      majStatut("Erreur de connexion : ${e.message}")
+                      fermer()
+                  }
+              }
+
+              /** Commande SBI "ESC P" : demande d'impression du poids (balances Minebea/Sartorius). */
+              private fun demanderPoids() {
+                  gestion.post {
+                      val p = port
+                      if (p == null) { majStatut("Balance non connectée"); return@post }
+                      try {
+                          p.write(byteArrayOf(0x1B, 'P'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte()), 1000)
+                          Etat.journaliser("→ demande de poids envoyée (ESC P)")
+                      } catch (e: Exception) { Etat.journaliser("Demande impossible : ${e.message}") }
+                  }
+              }
+
+              override fun onNewData(data: ByteArray) {
+                  val texte = String(data, Charsets.ISO_8859_1)
+                  gestion.post {
+                      tampon.append(texte)
+                      while (true) {
+                          val i = tampon.indexOfFirst { it == '\n' || it == '\r' }
+                          if (i < 0) break
+                          val ligne = tampon.substring(0, i)
+                          tampon.delete(0, i + 1)
+                          if (ligne.isNotBlank()) {
+                              lignesRecues.add(ligne)
+                              Etat.journaliser("← « ${ligne.replace("\u001B", "<ESC>")} »")
+                          }
+                      }
+                      gestion.removeCallbacks(finDePesee)
+                      gestion.postDelayed(finDePesee, delaiRegroupementMs)
+                  }
+              }
+
+              private fun traiterPesee() {
+                  if (tampon.isNotBlank()) { lignesRecues.add(tampon.toString()); tampon.clear() }
+                  if (lignesRecues.isEmpty()) return
+                  val pesee = Analyseur.analyser(lignesRecues.toList())
+                  lignesRecues.clear()
+                  if (pesee == null) {
+                      Etat.journaliser("Trame sans poids reconnu — non envoyée")
+                      return
+                  }
+                  Etat.dernierPoids = when {
+                      pesee.poids != null -> "${formater(pesee.poids)} ${pesee.unite}"
+                      else -> "${formater(pesee.quantite!!)} pcs"
+                  }
+                  Etat.dernierEnvoi = "Envoi en cours…"
+                  Etat.notifier()
+                  file.ajouter(pesee)
+              }
+
+              private fun formater(v: Double) =
+                  if (v == Math.floor(v)) v.toLong().toString() else v.toString().replace('.', ',')
+
+              override fun onRunError(e: Exception) {
+                  majStatut("Balance déconnectée (${e.message ?: "câble retiré ?"})")
+                  gestion.post { fermer() }
+              }
+
+              private fun majStatut(s: String) { Etat.statut = s; Etat.journaliser(s) }
+
+              private fun fermer() {
+                  try { lecteur?.stop() } catch (_: Exception) {}
+                  try { port?.close() } catch (_: Exception) {}
+                  lecteur = null; port = null
+              }
+
+              override fun onDestroy() {
+                  fermer(); file.arreter(); fil.quitSafely()
+                  majStatut("Arrêté")
+                  super.onDestroy()
+              }
+
+              companion object {
+                  const val ACTION_DEMANDER = "fr.sanimarc.pontbalance.DEMANDER"
+              }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/Etat.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/Etat.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          import android.os.Handler
+          import android.os.Looper
+
+          /** État partagé entre le service (arrière-plan) et l'écran. */
+          object Etat {
+              @Volatile var statut: String = "Balance non connectée"
+              @Volatile var dernierPoids: String = "—"
+              @Volatile var dernierEnvoi: String = ""
+              private val journal = ArrayDeque<String>()
+
+              private val principal = Handler(Looper.getMainLooper())
+              private val ecouteurs = mutableSetOf<() -> Unit>()
+
+              fun ecouter(f: () -> Unit) { ecouteurs.add(f) }
+              fun oublier(f: () -> Unit) { ecouteurs.remove(f) }
+
+              @Synchronized fun journaliser(ligne: String) {
+                  val heure = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.FRANCE).format(java.util.Date())
+                  journal.addFirst("$heure  $ligne")
+                  while (journal.size > 60) journal.removeLast()
+                  notifier()
+              }
+
+              @Synchronized fun texteJournal(): String = journal.joinToString("\n")
+
+              fun notifier() { principal.post { ecouteurs.toList().forEach { it() } } }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/FileEnvoi.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/FileEnvoi.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          import android.content.Context
+          import okhttp3.MediaType.Companion.toMediaType
+          import okhttp3.OkHttpClient
+          import okhttp3.Request
+          import okhttp3.RequestBody.Companion.toRequestBody
+          import org.json.JSONObject
+          import java.io.File
+          import java.util.concurrent.Executors
+          import java.util.concurrent.TimeUnit
+
+          /**
+           * Envoie les pesées au flow Power Automate.
+           * Si le Wi-Fi coupe, les pesées sont gardées dans un fichier et renvoyées
+           * dès que possible : aucune pesée n'est perdue.
+           */
+          class FileEnvoi(context: Context, private val reglages: Reglages) {
+
+              private val fichier = File(context.filesDir, "pesees_en_attente.txt")
+              private val executeur = Executors.newSingleThreadScheduledExecutor()
+              private val client = OkHttpClient.Builder()
+                  .connectTimeout(15, TimeUnit.SECONDS)
+                  .readTimeout(30, TimeUnit.SECONDS)
+                  .build()
+              private val json = "application/json; charset=utf-8".toMediaType()
+
+              init {
+                  // Nouvelle tentative régulière pour les pesées restées en attente
+                  executeur.scheduleWithFixedDelay({ viderFile() }, 10, 30, TimeUnit.SECONDS)
+              }
+
+              fun ajouter(p: Analyseur.Pesee) {
+                  val o = JSONObject()
+                  o.put("balance", reglages.nomBalance)
+                  o.put("tablette", android.os.Build.MODEL)
+                  o.put("horodatage", java.time.Instant.now().toString())
+                  o.put("trame", p.trame)
+                  o.put("poids", p.poids ?: JSONObject.NULL)
+                  o.put("unite", p.unite ?: "")
+                  o.put("quantite", p.quantite ?: JSONObject.NULL)
+                  executeur.execute {
+                      synchronized(fichier) { fichier.appendText(o.toString() + "\n") }
+                      viderFile()
+                  }
+              }
+
+              private fun viderFile() {
+                  val url = reglages.urlFlow
+                  if (!url.startsWith("https://")) return
+                  val lignes = synchronized(fichier) { if (fichier.exists()) fichier.readLines() else emptyList() }
+                      .filter { it.isNotBlank() }
+                  if (lignes.isEmpty()) return
+
+                  val restantes = mutableListOf<String>()
+                  var echec = false
+                  for (l in lignes) {
+                      if (echec) { restantes.add(l); continue }
+                      try {
+                          val req = Request.Builder().url(url).post(l.toRequestBody(json)).build()
+                          client.newCall(req).execute().use { rep ->
+                              if (rep.isSuccessful) {
+                                  Etat.dernierEnvoi = "Envoyé à " + java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.FRANCE).format(java.util.Date())
+                                  Etat.journaliser("ENVOI OK (${rep.code})")
+                              } else {
+                                  echec = true; restantes.add(l)
+                                  Etat.dernierEnvoi = "Refusé par le flow (code ${rep.code})"
+                                  Etat.journaliser("ENVOI REFUSÉ ${rep.code} : ${rep.body?.string()?.take(200)}")
+                              }
+                          }
+                      } catch (e: Exception) {
+                          echec = true; restantes.add(l)
+                          Etat.dernierEnvoi = "Pas de réseau — ${restantes.size} pesée(s) en attente"
+                          Etat.journaliser("ENVOI IMPOSSIBLE : ${e.message}")
+                      }
+                  }
+                  synchronized(fichier) {
+                      // On réécrit ce qui reste + ce qui a pu arriver pendant l'envoi
+                      val arriveesPendant = (if (fichier.exists()) fichier.readLines() else emptyList())
+                          .filter { it.isNotBlank() }.drop(lignes.size)
+                      fichier.writeText((restantes + arriveesPendant).joinToString("") { it + "\n" })
+                  }
+                  Etat.notifier()
+              }
+
+              fun arreter() { executeur.shutdown() }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/MainActivity.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/MainActivity.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          import android.Manifest
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var reglages: Reglages
+              private lateinit var txtStatut: TextView
+              private lateinit var txtPoids: TextView
+              private lateinit var txtEnvoi: TextView
+              private lateinit var txtJournal: TextView
+
+              private val rafraichir: () -> Unit = {
+                  txtStatut.text = Etat.statut
+                  txtPoids.text = Etat.dernierPoids
+                  txtEnvoi.text = Etat.dernierEnvoi
+                  txtJournal.text = Etat.texteJournal()
+              }
+
+              // Réponse à la demande d'autorisation USB
+              private val recepteurPermission = object : BroadcastReceiver() {
+                  override fun onReceive(c: Context, i: Intent) { lancerService(null) }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  reglages = Reglages(this)
+
+                  txtStatut = findViewById(R.id.txtStatut)
+                  txtPoids = findViewById(R.id.txtPoids)
+                  txtEnvoi = findViewById(R.id.txtEnvoi)
+                  txtJournal = findViewById(R.id.txtJournal)
+                  val edtNom = findViewById<EditText>(R.id.edtNomBalance)
+                  val edtUrl = findViewById<EditText>(R.id.edtUrl)
+                  val spnBaud = findViewById<Spinner>(R.id.spnBaud)
+                  val spnFormat = findViewById<Spinner>(R.id.spnFormat)
+
+                  edtNom.setText(reglages.nomBalance)
+                  edtUrl.setText(reglages.urlFlow)
+                  spnBaud.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, Reglages.VITESSES)
+                  spnBaud.setSelection(Reglages.VITESSES.indexOf(reglages.vitesse).coerceAtLeast(0))
+                  spnFormat.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, Reglages.FORMATS)
+                  spnFormat.setSelection(Reglages.FORMATS.indexOf(reglages.format).coerceAtLeast(0))
+
+                  findViewById<Button>(R.id.btnConnecter).setOnClickListener {
+                      reglages.nomBalance = edtNom.text.toString()
+                      reglages.urlFlow = edtUrl.text.toString()
+                      reglages.vitesse = spnBaud.selectedItem as Int
+                      reglages.format = spnFormat.selectedItem as String
+                      if (!reglages.estComplet) {
+                          Toast.makeText(this, "Renseigner le nom de la balance et l'URL du flow (https://…)", Toast.LENGTH_LONG).show()
+                          return@setOnClickListener
+                      }
+                      lancerService(null)
+                  }
+                  findViewById<Button>(R.id.btnDemander).setOnClickListener { lancerService(BalanceService.ACTION_DEMANDER) }
+                  findViewById<Button>(R.id.btnArreter).setOnClickListener {
+                      stopService(Intent(this, BalanceService::class.java))
+                  }
+
+                  ContextCompat.registerReceiver(
+                      this, recepteurPermission, IntentFilter(ACTION_PERMISSION), ContextCompat.RECEIVER_NOT_EXPORTED
+                  )
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+
+                  // Balance branchée alors que tout est réglé : on démarre tout seul
+                  if (reglages.estComplet) lancerService(null)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  if (reglages.estComplet) lancerService(null)
+              }
+
+              private fun lancerService(action: String?) {
+                  val i = Intent(this, BalanceService::class.java).setAction(action)
+                  ContextCompat.startForegroundService(this, i)
+              }
+
+              override fun onStart() { super.onStart(); Etat.ecouter(rafraichir); rafraichir() }
+              override fun onStop() { Etat.oublier(rafraichir); super.onStop() }
+              override fun onDestroy() { unregisterReceiver(recepteurPermission); super.onDestroy() }
+
+              companion object {
+                  const val ACTION_PERMISSION = "fr.sanimarc.pontbalance.PERMISSION_USB"
+              }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/java/fr/sanimarc/pontbalance/Reglages.kt')"
+          cat > 'app/src/main/java/fr/sanimarc/pontbalance/Reglages.kt' <<'FIN_FICHIER'
+          package fr.sanimarc.pontbalance
+
+          import android.content.Context
+
+          /** Réglages saisis par l'utilisateur, conservés sur la tablette. */
+          class Reglages(context: Context) {
+              private val prefs = context.getSharedPreferences("reglages", Context.MODE_PRIVATE)
+
+              var nomBalance: String
+                  get() = prefs.getString("nomBalance", "") ?: ""
+                  set(v) = prefs.edit().putString("nomBalance", v.trim()).apply()
+
+              var urlFlow: String
+                  get() = prefs.getString("urlFlow", "") ?: ""
+                  set(v) = prefs.edit().putString("urlFlow", v.trim()).apply()
+
+              /** Vitesse choisie dans la liste (doit correspondre au menu de la balance). */
+              var vitesse: Int
+                  get() = prefs.getInt("vitesse", VITESSES[0])
+                  set(v) = prefs.edit().putInt("vitesse", v).apply()
+
+              /** "8N1", "7O1" ou "7E1". */
+              var format: String
+                  get() = prefs.getString("format", FORMATS[0]) ?: FORMATS[0]
+                  set(v) = prefs.edit().putString("format", v).apply()
+
+              val estComplet: Boolean get() = nomBalance.isNotBlank() && urlFlow.startsWith("https://")
+
+              companion object {
+                  /** Vitesses standard d'une liaison série. */
+                  val VITESSES = listOf(9600, 1200, 2400, 4800, 19200, 38400, 57600, 115200)
+                  val FORMATS = listOf("8N1", "7O1", "7E1")
+              }
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/res/layout/activity_main.xml')"
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'FIN_FICHIER'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="20dp">
+
+                  <TextView
+                      android:id="@+id/txtStatut"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Balance non connectée"
+                      android:textColor="#FFF5A623"
+                      android:textSize="18sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/txtPoids"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="12dp"
+                      android:gravity="center"
+                      android:text="—"
+                      android:textColor="#FFFFFFFF"
+                      android:textSize="56sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/txtEnvoi"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:gravity="center"
+                      android:text=""
+                      android:textColor="#FF9AA3AD"
+                      android:textSize="14sp" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="RÉGLAGES"
+                      android:textColor="#FF9AA3AD"
+                      android:textStyle="bold" />
+
+                  <EditText
+                      android:id="@+id/edtNomBalance"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="Nom de la balance (ex : BAL 30)"
+                      android:inputType="text"
+                      android:textColor="#FFFFFFFF"
+                      android:textColorHint="#FF6B7480" />
+
+                  <EditText
+                      android:id="@+id/edtUrl"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:hint="URL du flow Power Automate (déclencheur HTTP)"
+                      android:inputType="textUri"
+                      android:textColor="#FFFFFFFF"
+                      android:textColorHint="#FF6B7480" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Vitesse (doit correspondre au menu de la balance)"
+                      android:textColor="#FF9AA3AD" />
+
+                  <Spinner
+                      android:id="@+id/spnBaud"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:text="Format des données"
+                      android:textColor="#FF9AA3AD" />
+
+                  <Spinner
+                      android:id="@+id/spnFormat"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content" />
+
+                  <Button
+                      android:id="@+id/btnConnecter"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="Enregistrer et connecter la balance" />
+
+                  <Button
+                      android:id="@+id/btnDemander"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Demander le poids à la balance" />
+
+                  <Button
+                      android:id="@+id/btnArreter"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:text="Arrêter" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="24dp"
+                      android:text="DIAGNOSTIC (données brutes reçues)"
+                      android:textColor="#FF9AA3AD"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:id="@+id/txtJournal"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:background="#FF1C1F24"
+                      android:fontFamily="monospace"
+                      android:padding="8dp"
+                      android:textColor="#FFB8C2CC"
+                      android:textIsSelectable="true"
+                      android:textSize="12sp" />
+              </LinearLayout>
+          </ScrollView>
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'FIN_FICHIER'
+          <resources>
+              <string name="app_name">Pont Balance</string>
+          </resources>
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'FIN_FICHIER'
+          <resources>
+              <style name="Theme.PontBalance" parent="Theme.Material3.Dark.NoActionBar">
+                  <item name="android:windowBackground">#FF121417</item>
+              </style>
+          </resources>
+          FIN_FICHIER
+          mkdir -p "$(dirname 'app/src/main/res/xml/device_filter.xml')"
+          cat > 'app/src/main/res/xml/device_filter.xml' <<'FIN_FICHIER'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Filtre vide = tout appareil USB série branché déclenche l'ouverture -->
+          <resources>
+              <usb-device />
+          </resources>
+          FIN_FICHIER
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'FIN_FICHIER'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FIN_FICHIER
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'FIN_FICHIER'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          FIN_FICHIER
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'FIN_FICHIER'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral(); maven("https://jitpack.io") }
+          }
+          rootProject.name = "PontBalance"
+          include(":app")
+          FIN_FICHIER
+          find . -type f
+      - name: Compiler
+        working-directory: projet
+        run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: PontBalance-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: projet/app/build/outputs/apk/debug/app-debug.apk
